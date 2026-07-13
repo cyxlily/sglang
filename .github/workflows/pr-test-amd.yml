@@ -1146,8 +1146,11 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
+      # TEMP (validation only, revert before merge): pin the last known-good
+      # image (20260709) to check whether the MI35X GPU hang reproduces with our
+      # sglang on the older ROCm/driver stack.
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image rocm/sgl-dev:v0.5.14-rocm700-mi35x-20260709
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
