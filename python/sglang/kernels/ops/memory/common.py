@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -9,7 +11,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_npu,
     is_xpu,
     next_power_of_2,
 )
@@ -17,7 +18,6 @@ from sglang.srt.utils import (
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
@@ -184,7 +184,7 @@ def get_last_loc_triton(
 
 
 @triton.jit
-def assign_extend_cache_locs(
+def gather_req_to_token_pool_triton(
     req_pool_indices,
     req_to_token,
     start_offset,
@@ -218,22 +218,22 @@ def assign_extend_cache_locs(
         save_offset += BLOCK_SIZE
 
 
-def assign_extend_cache_locs_func(
+def gather_cache_indices(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
     start_offset: torch.Tensor,
     end_offset: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int,
-    device,
+    num_tokens: int,
+    device: torch.device | str,
+    req_pool_indices_cpu: Optional[torch.Tensor] = None,
+    start_offset_cpu: Optional[torch.Tensor] = None,
+    end_offset_cpu: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    batch_size = req_pool_indices.shape[0]
+
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs[(batch_size,)](
+        out_cache_loc = torch.empty((num_tokens,), dtype=torch.int64, device=device)
+        gather_req_to_token_pool_triton[(batch_size,)](
             req_pool_indices,
             req_to_token,
             start_offset,
@@ -242,31 +242,13 @@ def assign_extend_cache_locs_func(
             req_to_token.shape[1],
             next_power_of_2(batch_size),
         )
-
         return out_cache_loc
 
-    elif _is_npu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int32,
-            device=device,
-        )
-        torch.ops.npu.cache_loc_update(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
-
-        return out_cache_loc
-
-    elif _is_cpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
+    if _is_cpu:
+        out_cache_loc = torch.empty((num_tokens,), dtype=torch.int64, device=device)
+        # Name lags the Python layer on purpose: this is a published
+        # sgl_kernel torch.ops schema (torch_extension_cpu.cpp), not an
+        # in-tree symbol we can rename without a wheel bump.
         assign_extend_cache_locs_cpu(
             req_pool_indices,
             req_to_token,
@@ -275,8 +257,21 @@ def assign_extend_cache_locs_func(
             out_cache_loc,
             req_to_token.shape[1],
         )
-
         return out_cache_loc
+
+    assert req_pool_indices_cpu is not None, "torch fallback needs host mirrors"
+    assert start_offset_cpu is not None, "torch fallback needs host mirrors"
+    assert end_offset_cpu is not None, "torch fallback needs host mirrors"
+
+    out_cache_loc_i32 = torch.empty((num_tokens,), dtype=torch.int32, device=device)
+    pt = 0
+    for i in range(batch_size):
+        req_idx = int(req_pool_indices_cpu[i])
+        start = int(start_offset_cpu[i])
+        end = int(end_offset_cpu[i])
+        out_cache_loc_i32[pt : pt + (end - start)] = req_to_token[req_idx, start:end]
+        pt += end - start
+    return out_cache_loc_i32.to(torch.int64)
 
 
 @triton.jit

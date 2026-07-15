@@ -492,7 +492,7 @@ def eagle_prepare_for_verify(
     target_worker: TpModelWorker,
 ):
     from sglang.kernels.ops.memory.common import (
-        assign_extend_cache_locs_func,
+        gather_cache_indices,
     )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -512,13 +512,12 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        batch.out_cache_loc = assign_extend_cache_locs_func(
+        batch.out_cache_loc = gather_cache_indices(
             req_pool_indices=batch.req_pool_indices,
             req_to_token=req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
             end_offset=batch.seq_lens + verify_input.draft_token_num,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
+            num_tokens=bs * verify_input.draft_token_num,
             device=device,
         )
 
