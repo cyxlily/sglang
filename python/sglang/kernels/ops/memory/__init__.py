@@ -40,6 +40,13 @@ register_kernel(
         target="sglang.kernels.ops.memory.req_to_token_pool:GatherReqToTokenPool.triton",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="memory.scatter_req_to_token_pool",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:ScatterReqToTokenPool.triton",
+    )
+)
 
 __all__ = []
 
