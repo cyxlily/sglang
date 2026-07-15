@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -877,6 +878,65 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def _process_tree_snapshot(pid):
+    """(pid, create_time) pairs for a process and its recursive children."""
+    try:
+        proc = psutil.Process(pid)
+        return [
+            (p.pid, p.create_time()) for p in [proc] + proc.children(recursive=True)
+        ]
+    except psutil.NoSuchProcess:
+        return []
+
+
+def _wait_for_process_tree_exit(tree, timeout=120):
+    """Block until every process in ``tree`` has exited, or ``timeout`` passes.
+
+    ``kill_process_tree`` only delivers signals. On GPUs with slow context
+    teardown (>30s observed on GB300) a dying scheduler keeps its listen
+    ports until it fully exits, so relaunching a server on the same port
+    plan races it and dies with "rpc_port ... is used by a process
+    already". Wait for real exit before the ports are reused.
+    """
+    kill_time = time.time()
+    deadline = time.perf_counter() + timeout
+    alive = []
+    while time.perf_counter() < deadline:
+        alive = []
+        for pid, create_time in tree:
+            try:
+                p = psutil.Process(pid)
+                if (
+                    p.create_time() == create_time
+                    and p.status() != psutil.STATUS_ZOMBIE
+                ):
+                    alive.append(pid)
+            except psutil.NoSuchProcess:
+                continue
+        # Scheduler processes detach from the launcher during startup
+        # (reparented to PID 1), so a tree walk misses them; they self-exit
+        # on parent loss but slowly when GPU work is in flight. Match the
+        # orphans by their "sglang::" proc title. Caveat: a healthy sibling
+        # server's schedulers (PD-disagg tests) can also match, so this wait
+        # is timeout-bounded — worst case is a slower retry, never a hang.
+        for p in psutil.process_iter(["name", "create_time", "ppid"]):
+            try:
+                if (
+                    (p.info["name"] or "").startswith("sglang::")
+                    and p.info["ppid"] == 1
+                    and p.info["create_time"] < kill_time
+                    and p.status() != psutil.STATUS_ZOMBIE
+                ):
+                    alive.append(p.pid)
+            except psutil.NoSuchProcess:
+                continue
+        if not alive:
+            return True
+        time.sleep(1)
+    print(f"CI_OFFLINE: killed server tree still alive after {timeout}s: {alive}")
+    return False
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -970,6 +1030,10 @@ def popen_launch_server(
 
     print(f"command={shlex.join(command)}")
 
+    # Slow-teardown GPUs (GB300) can hold the previous server's ports past
+    # its kill; give in-server port waits enough patience to outlive that.
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
     # Track if offline mode was enabled for potential retry
     offline_enabled = env.get("HF_HUB_OFFLINE") == "1"
 
@@ -983,12 +1047,17 @@ def popen_launch_server(
             f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
         )
 
-        # Kill failed process
+        # Kill the failed process and wait for its whole tree to actually
+        # exit: a dying scheduler can hold the port plan long after
+        # kill_process_tree() returns (slow GPU teardown), and the retry
+        # below reuses the same ports.
         try:
+            tree = _process_tree_snapshot(process.pid)
             if process.poll() is None:
                 kill_process_tree(process.pid)
             else:
                 process.wait(timeout=5)
+            _wait_for_process_tree_exit(tree)
         except Exception as e:
             print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
 
