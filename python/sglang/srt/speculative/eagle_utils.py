@@ -491,7 +491,7 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
-    from sglang.kernels.ops.speculative.cache_locs import (
+    from sglang.kernels.ops.memory.common import (
         assign_extend_cache_locs_func,
     )
     from sglang.srt.model_executor.forward_batch_info import (
