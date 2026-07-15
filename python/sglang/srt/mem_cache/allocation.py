@@ -46,13 +46,13 @@ def write_cache_indices(
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
-    seq_lens_tensor: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    extend_lens_tensor: torch.Tensor,
-    extend_lens_cpu: torch.Tensor,
+    alloc_starts_tensor: torch.Tensor,
+    alloc_starts_cpu: torch.Tensor,
+    alloc_ends_tensor: torch.Tensor,
+    alloc_ends_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
-):
+) -> None:
     if support_triton(get_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
@@ -65,8 +65,8 @@ def write_cache_indices(
             req_pool_indices_tensor,
             prefix_pointers,
             prefix_lens_tensor,
-            seq_lens_tensor,
-            extend_lens_tensor,
+            alloc_starts_tensor,
+            alloc_ends_tensor,
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
         )
@@ -75,18 +75,19 @@ def write_cache_indices(
         for i in range(req_pool_indices_cpu.shape[0]):
             req_idx = req_pool_indices_cpu[i].item()
             prefix_len = prefix_lens_cpu[i].item()
-            seq_len = seq_lens_cpu[i].item()
-            extend_len = extend_lens_cpu[i].item()
+            alloc_start = alloc_starts_cpu[i].item()
+            alloc_end = alloc_ends_cpu[i].item()
+            alloc_len = alloc_end - alloc_start
 
             req_to_token_pool.write(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
             )
             req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
+                (req_idx, slice(alloc_start, alloc_end)),
+                out_cache_loc[pt : pt + alloc_len],
             )
-            pt += extend_len
+            pt += alloc_len
 
 
 def get_last_loc(
@@ -305,9 +306,7 @@ def alloc_for_extend(
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
@@ -345,10 +344,10 @@ def alloc_for_extend(
         req_pool_indices_cpu,
         prefix_lens_device,
         prefix_lens_cpu,
+        prefix_lens_device,
+        prefix_lens_cpu,
         batch.seq_lens,
         batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
     )

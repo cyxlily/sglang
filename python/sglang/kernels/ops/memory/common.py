@@ -31,8 +31,8 @@ def write_req_to_token_pool_triton(
     req_pool_indices,
     prefix_tensors,
     pre_lens,
-    seq_lens,
-    extend_lens,
+    alloc_starts,
+    alloc_ends,
     out_cache_loc,
     req_to_token_ptr_stride: tl.constexpr,
 ):
@@ -41,7 +41,8 @@ def write_req_to_token_pool_triton(
 
     req_pool_index = tl.load(req_pool_indices + pid)
     pre_len = tl.load(pre_lens + pid)
-    seq_len = tl.load(seq_lens + pid)
+    alloc_start = tl.load(alloc_starts + pid)
+    alloc_end = tl.load(alloc_ends + pid)
     prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
 
     # write prefix
@@ -59,18 +60,19 @@ def write_req_to_token_pool_triton(
     # NOTE: This can be slow for large bs
     cumsum_start = tl.cast(0, tl.int64)
     for i in range(pid):
-        cumsum_start += tl.load(extend_lens + i)
+        cumsum_start += tl.load(alloc_ends + i) - tl.load(alloc_starts + i)
 
-    num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
+    alloc_len = alloc_end - alloc_start
+    num_loop = tl.cdiv(alloc_len, BLOCK_SIZE)
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < (seq_len - pre_len)
+        mask = offset < alloc_len
         value = tl.load(out_cache_loc + cumsum_start + offset, mask=mask)
         tl.store(
             req_to_token_ptr
             + req_pool_index * req_to_token_ptr_stride
             + offset
-            + pre_len,
+            + alloc_start,
             value,
             mask=mask,
         )
