@@ -185,8 +185,9 @@ def _get_mhc_ops() -> MhcOps:
     """
     if _is_xpu:
         from sgl_kernel import hc_split_sinkhorn
+        from sgl_kernel.mhc import mhc_fused_post_pre
 
-        return MhcOps(hc_split_sinkhorn, None, None)
+        return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, None)
 
     from sglang.kernels.ops.layernorm.mhc import (
         hc_split_sinkhorn,
@@ -209,9 +210,11 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
-    # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
-    # not read that flag and dispatches independently for both small and large
-    # token batches, so the standalone pre flag must not veto the fused opt-in.
+    # CUDA/HIP fused path reuses TileLang mhc_post/mhc_pre kernels and their
+    # tensor layout assumptions. XPU uses the sgl-kernel SYCL fused interface.
+    if _is_xpu:
+        return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+
     return (
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
@@ -1505,6 +1508,29 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        if _is_xpu or x.device.type == "xpu":
+            import sgl_kernel  # noqa: F401
+            from sgl_kernel.mhc import mhc_pre
+
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
+            )
+            return y, post, comb, norm is not None
+
         if x.shape[0] == 0:
             y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
             post = torch.empty((0, self.hc_mult), dtype=torch.float32, device=x.device)
@@ -1605,6 +1631,17 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+
+        if _is_xpu or x.device.type == "xpu":
+            import sgl_kernel  # noqa: F401
+            from sgl_kernel.mhc import mhc_post
+
+            return mhc_post(
+                x=x,
+                residual=residual,
+                post_layer_mix=post,
+                comb_res_mix=comb,
+            )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_post
