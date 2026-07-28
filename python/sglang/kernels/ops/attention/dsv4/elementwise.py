@@ -15,6 +15,9 @@ from .utils import make_name
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
+if _is_xpu:
+    import sgl_kernel
+
 
 @cache_once
 def _jit_fused_rope_module():
@@ -146,9 +149,7 @@ def fused_q_norm_rope(
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     if _is_xpu:
-        from sgl_kernel import fused_q_norm_rope as xpu_fused_q_norm_rope
-
-        xpu_fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+        sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
         return
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
@@ -274,11 +275,7 @@ def fused_k_norm_rope_flashmla(
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     if _is_xpu:
-        from sgl_kernel import (
-            fused_k_norm_rope_flashmla as xpu_fused_k_norm_rope_flashmla,
-        )
-
-        xpu_fused_k_norm_rope_flashmla(
+        sgl_kernel.fused_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
         return
