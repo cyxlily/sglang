@@ -184,8 +184,7 @@ def _get_mhc_ops() -> MhcOps:
     their communication workspaces.  DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
-        from sgl_kernel import hc_split_sinkhorn
-        from sgl_kernel.mhc import mhc_fused_post_pre
+        from sgl_kernel import hc_split_sinkhorn, mhc_fused_post_pre
 
         return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, None)
 
@@ -1507,8 +1506,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _is_xpu or x.device.type == "xpu":
-            import sgl_kernel  # noqa: F401
-            from sgl_kernel.mhc import mhc_pre
+            from sgl_kernel import mhc_pre
 
             norm_kwargs = {}
             if norm is not None:
@@ -1631,8 +1629,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if _is_xpu or x.device.type == "xpu":
-            import sgl_kernel  # noqa: F401
-            from sgl_kernel.mhc import mhc_post
+            from sgl_kernel import hc_post as mhc_post
 
             return mhc_post(
                 x=x,
@@ -2249,8 +2246,7 @@ class DeepseekV4Model(nn.Module):
     ):
         if x.numel() > 0:
             if _is_xpu or x.device.type == "xpu":
-                import sgl_kernel  # noqa: F401
-                from sgl_kernel.mhc import fused_hc_head
+                from sgl_kernel import fused_hc_head
 
                 return fused_hc_head(
                     x.contiguous(),
