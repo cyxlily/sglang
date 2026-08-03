@@ -200,7 +200,7 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not _is_xpu
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -210,8 +210,6 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
-    # CUDA/HIP fused path reuses TileLang mhc_post/mhc_pre kernels and their
-    # tensor layout assumptions. XPU uses the sgl-kernel SYCL fused interface.
     if _is_xpu:
         return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
 
@@ -2877,7 +2875,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        # Use the effective ``_FP8_WO_A_GEMM`` (which folds in the XPU disable)
+        # rather than the raw env: XPU can't consume fp8 ``wo_a`` at forward
+        # time regardless of the env, so we always want the dequant path there.
+        if not _FP8_WO_A_GEMM:
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
