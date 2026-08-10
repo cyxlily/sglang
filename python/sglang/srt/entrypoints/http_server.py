@@ -42,6 +42,7 @@ from typing import (
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 import uvicorn
 import uvloop
@@ -60,6 +61,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -251,6 +253,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
     set_global_state(
         _GlobalState(
@@ -427,10 +430,33 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
+class ORJSONRequest(Request):
+    """Request whose ``json()`` uses orjson, for the tens-of-MB multimodal
+    bodies FastAPI would otherwise hand to stdlib json. Stricter than stdlib
+    on bare NaN/Infinity and >64-bit ints: those now 400 instead of parsing.
+    """
+
+    async def json(self) -> Any:
+        if not hasattr(self, "_json"):
+            self._json = orjson.loads(await self.body())
+        return self._json
+
+
+class ORJSONRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def custom_handler(request: Request):
+            return await original_handler(ORJSONRequest(request.scope, request.receive))
+
+        return custom_handler
+
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -449,10 +475,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+# route_class is per-router, so included routers need it set too.
+v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
+elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
 
@@ -766,6 +795,7 @@ async def server_info():
                 dataclasses.asdict(server_args)
             ),
             **_global_state.scheduler_info,
+            "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
@@ -865,7 +895,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     "error": {
                         "message": str(e),
                         "type": "invalid_request_error",
-                        "code": 400,
+                        "code": getattr(e, "status_code", 400),
                         "retryable": False,
                     }
                 }
@@ -2011,14 +2041,17 @@ async def vertex_generate(
         **(vertex_req.parameters or {}),
     )
     ret = await generate_request(req, raw_request)
-    if isinstance(ret, Response):
-        return ret
+    if isinstance(ret, Response) and ret.status_code == 200 and hasattr(ret, "body"):
+        return ORJSONResponse({"predictions": orjson.loads(ret.body)})
+    return ret
+
     return ORJSONResponse({"predictions": ret})
 
 
 def _create_error_response(e):
     return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+        {"error": {"message": str(e)}},
+        status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),
     )
 
 
@@ -2493,7 +2526,12 @@ def _setup_and_run_http_server(
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args, server_args, scheduler_infos[0]
+            port_args,
+            server_args,
+            {
+                **scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            },
         )
 
     try:
