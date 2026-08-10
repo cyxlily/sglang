@@ -2893,9 +2893,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        if (
+            _is_npu
+            or _is_xpu
+            or not (
+                envs.SGLANG_DSV4_MHC_PREWARM.get()
+                and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            )
         ):
             return
         layer = next(
@@ -2943,14 +2947,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 device=residual.device,
             ),
         )
-        if torch.xpu.is_available():
-            torch.xpu.synchronize()
-        else:
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
         compile_secs = time.perf_counter() - tic
         # Runs before init_memory_pool(); don't let transients skew pool sizing.
-        if not torch.xpu.is_available():
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         get_tp_group().barrier()
         logger.info(
             "DeepSeek V4 MHC prewarm at load: compile %.1fs, rank sync +%.1fs",
